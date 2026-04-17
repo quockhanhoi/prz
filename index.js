@@ -1,36 +1,56 @@
+const express = require("express");
 const axios = require("axios");
 const { HttpsProxyAgent } = require("https-proxy-agent");
-const pLimit = require("p-limit");
+const pLimit = require("p-limit").default;
+
+const app = express();
+app.use(express.json());
 
 // ================= CONFIG =================
 const CONCURRENCY = 100;
 const TIMEOUT = 4000;
-const BATCH_SIZE = 50;
+const LOOP_TIME = 10 * 60 * 1000;
 
-const API = "https://zit-note.onrender.com/api/note";
+const NOTE_API = "https://zit-note.onrender.com/api/note";
 
-// ================= ALL SOURCES =================
+// 👉 NOTE MASTER (tạo sẵn 1 cái rồi lấy ID)
+const MASTER_NOTE_ID = "8bac9c8e-4550-4381-ab8d-5baf2fb9e5c2";
+const MASTER_API = `https://zit-note.onrender.com/note/${MASTER_NOTE_ID}`;
+
+let currentProxies = [];
+
+// ================= FULL SOURCES =================
 const SOURCES = [
 
-  // ProxyScrape
   "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http",
   "https://api.proxyscrape.com/v2/?request=getproxies&protocol=https",
   "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4",
   "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5",
 
-  // ProxyScan
   "https://www.proxyscan.io/download?type=http",
   "https://www.proxyscan.io/download?type=https",
   "https://www.proxyscan.io/download?type=socks4",
   "https://www.proxyscan.io/download?type=socks5",
 
-  // Proxy-list.download
   "https://www.proxy-list.download/api/v1/get?type=http",
   "https://www.proxy-list.download/api/v1/get?type=https",
   "https://www.proxy-list.download/api/v1/get?type=socks4",
   "https://www.proxy-list.download/api/v1/get?type=socks5",
 
-  // GitHub lớn
+  "https://openproxy.space/list/http",
+  "https://openproxy.space/list/socks4",
+  "https://openproxy.space/list/socks5",
+
+  "https://proxyspace.pro/http.txt",
+  "https://proxyspace.pro/https.txt",
+  "https://proxyspace.pro/socks4.txt",
+  "https://proxyspace.pro/socks5.txt",
+
+  "https://spys.me/proxy.txt",
+  "https://spys.me/socks.txt",
+
+  "https://rootjazz.com/proxies/proxies.txt",
+
   "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
   "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
   "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
@@ -48,36 +68,17 @@ const SOURCES = [
   "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
   "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
   "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-  "https://raw.githubusercontent.com/opsxcq/proxy-list/master/list.txt",
-
-  // Extra hiếm
-  "https://openproxy.space/list/http",
-  "https://openproxy.space/list/socks4",
-  "https://openproxy.space/list/socks5",
-
-  "https://proxyspace.pro/http.txt",
-  "https://proxyspace.pro/https.txt",
-  "https://proxyspace.pro/socks4.txt",
-  "https://proxyspace.pro/socks5.txt",
-
-  "https://spys.me/proxy.txt",
-  "https://spys.me/socks.txt",
-
-  "https://rootjazz.com/proxies/proxies.txt"
-];
-
-// ================= TEST URL =================
-const TEST_URLS = [
-  "https://httpbin.org/ip",
-  "https://api.ipify.org",
-  "https://ifconfig.me/ip"
+  "https://raw.githubusercontent.com/opsxcq/proxy-list/master/list.txt"
 ];
 
 // ================= FETCH =================
 async function fetchProxies() {
   const results = await Promise.all(
     SOURCES.map(url =>
-      axios.get(url, { timeout: 10000 }).then(r => r.data).catch(() => "")
+      axios.get(url, {
+        timeout: 10000,
+        headers: { "User-Agent": "Mozilla/5.0" }
+      }).then(r => r.data).catch(() => "")
     )
   );
 
@@ -85,8 +86,11 @@ async function fetchProxies() {
 
   results.join("\n").split("\n").forEach(line => {
     line = line.trim();
-    if (line.includes(":")) {
-      if (!line.startsWith("http")) line = "http://" + line;
+    if (!line) return;
+
+    if (/^\d+\.\d+\.\d+\.\d+:\d+$/.test(line)) {
+      set.add("http://" + line);
+    } else if (line.startsWith("http")) {
       set.add(line);
     }
   });
@@ -98,47 +102,51 @@ async function fetchProxies() {
 async function check(proxy) {
   try {
     const agent = new HttpsProxyAgent(proxy);
-    const url = TEST_URLS[Math.floor(Math.random() * TEST_URLS.length)];
 
-    const start = Date.now();
-
-    const res = await axios.get(url, {
+    const res = await axios.get("https://httpbin.org/ip", {
       httpAgent: agent,
       httpsAgent: agent,
       timeout: TIMEOUT
     });
 
-    const latency = Date.now() - start;
-
-    if (res.status === 200 && latency < 3000) {
-      return {
-        proxy,
-        latency,
-        score: 5000 - latency
-      };
-    }
-
+    if (res.status === 200) return proxy;
     return null;
+
   } catch {
     return null;
   }
 }
 
-// ================= PUSH =================
-async function pushBatch(list) {
-  try {
-    await axios.post(API, { proxies: list });
-    console.log("Pushed:", list.length);
-  } catch {
-    console.log("Push fail");
-  }
+// ================= CREATE NOTE =================
+async function createNote(content) {
+  const res = await axios.post(NOTE_API, {
+    content: JSON.stringify(content)
+  });
+  return res.data;
+}
+
+// ================= UPDATE MASTER =================
+async function updateMaster(link, total, live) {
+  const data = {
+    content: JSON.stringify({
+      proxies: [
+        {
+          proxy: link,
+          so_luong: total,
+          live: live
+        }
+      ]
+    })
+  };
+
+  await axios.post(MASTER_API, data);
 }
 
 // ================= MAIN =================
-async function main() {
-  console.log("Fetching...");
-  const raw = await fetchProxies();
+async function run() {
+  console.log("===== RUN =====");
 
+  const raw = await fetchProxies();
   console.log("RAW:", raw.length);
 
   const limit = pLimit(CONCURRENCY);
@@ -148,19 +156,47 @@ async function main() {
   );
 
   let live = results.filter(Boolean);
-
-  // sort theo chất lượng
-  live.sort((a, b) => b.score - a.score);
-
   console.log("LIVE:", live.length);
 
-  // push batch
-  for (let i = 0; i < live.length; i += BATCH_SIZE) {
-    const chunk = live.slice(i, i + BATCH_SIZE);
-    await pushBatch(chunk);
-  }
+  // giữ proxy nhanh
+  live = live.slice(0, 1000);
+  currentProxies = live;
+
+  // tạo note proxy
+  const proxyNote = await createNote({
+    proxies: live
+  });
+
+  const link = proxyNote.url || proxyNote.id;
+
+  // update master
+  await updateMaster(link, raw.length, live.length);
+
+  console.log("UPDATED MASTER");
 }
 
 // ================= LOOP =================
-setInterval(main, 10 * 60 * 1000);
-main();
+setInterval(run, LOOP_TIME);
+run();
+
+// ================= API =================
+app.get("/", (req, res) => {
+  res.send("PROXY SYSTEM RUNNING");
+});
+
+app.get("/get-proxy", (req, res) => {
+  if (currentProxies.length === 0) {
+    return res.status(404).json({ error: "no proxy" });
+  }
+
+  const proxy = currentProxies[Math.floor(Math.random() * currentProxies.length)];
+
+  res.json({ proxy });
+});
+
+// ================= START =================
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
